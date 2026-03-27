@@ -33,6 +33,7 @@ const payer = Keypair.generate();
 
 await runTest({
   testConfig: {
+    routeWorkspaceToTemp: true, // protect your repo artifacts
     scenarios: [
       {
         name: "Transfer SOL",
@@ -58,9 +59,32 @@ await runTest({
 
 ## Core Concepts
 
-### Workspace Isolation
+### `routeWorkspaceToTemp` — Protecting Your Codebase Artifacts
 
-Every test gets its own temporary workspace. Accounts, programs, and state are copied in, and cleaned up after.
+This is the most important flag in Solarium. When enabled, the test runner copies your entire workspace to a temporary directory before execution. All mutations (account state changes, program outputs) happen in the temp copy — **your committed artifacts are never touched**.
+
+Without it, the Solana test runtime writes directly into your workspace, modifying the account JSON files you carefully downloaded and committed. This contaminates your repo with post-execution state and breaks idempotency.
+
+```typescript
+await runTest({
+  testConfig: {
+    routeWorkspaceToTemp: true, // always recommended
+    scenarios: [/* ... */],
+  },
+  // ...
+});
+```
+
+**The recommended workflow:**
+
+1. Download mainnet accounts with `AccountDownloader` into your workspace
+2. Commit those account artifacts to your repo (they're your test fixtures)
+3. Set `routeWorkspaceToTemp: true` so tests run against a temp copy
+4. Tests are hermetic and idempotent — run them 1000 times, same result
+
+### Workspace Structure
+
+Every test workspace follows a standard layout. Accounts and programs are stored as JSON/SO files, and `routeWorkspaceToTemp` ensures they stay clean across runs.
 
 ```typescript
 import { WorkspaceManager, buildWorkspace } from "solarium";
@@ -98,7 +122,7 @@ TokenHacker.createTokenAccount({
 
 ### Live Account Downloading
 
-Pull real on-chain accounts for integration-style tests:
+Pull real on-chain accounts and commit them as test fixtures. These become your source-of-truth artifacts — `routeWorkspaceToTemp` ensures tests never overwrite them.
 
 ```typescript
 import { AccountDownloader } from "solarium";
@@ -108,6 +132,10 @@ await downloader.download({
   accounts: [new PublicKey("So11111111111111111111111111111111111111112")],
   outputDir: "./test-workspace/accounts",
 });
+
+// Now commit these to your repo:
+//   git add test-workspace/accounts/
+//   git commit -m "Add mainnet account fixtures"
 ```
 
 ### Connection Mock
@@ -128,6 +156,7 @@ Chain dependent scenarios with shared account state:
 ```typescript
 await runTest({
   testConfig: {
+    routeWorkspaceToTemp: true,
     scenarios: [
       {
         name: "Initialize",
