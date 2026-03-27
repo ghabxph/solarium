@@ -9,7 +9,8 @@ Solarium eliminates the pain of testing Solana programs by giving you isolated w
 - **Hermetic by design** — Each test runs in an isolated workspace. No shared state, no flaky tests.
 - **Declarative test configuration** — Define scenarios with accounts, signers, and expected outcomes in a single config object.
 - **Built-in account mocking** — Create synthetic token accounts and mints (SPL Token & Token-2022) without an RPC connection.
-- **Live account downloading** — Fetch real account data from any Solana RPC endpoint for realistic integration tests.
+- **Live account downloading** — Fetch real account data from any Solana RPC endpoint, or let `ConnectionMock` auto-cache accounts on first access.
+- **True `web3.Connection` drop-in** — `ConnectionMock` extends `Connection`, so it works everywhere the SDK expects one — reads from artifacts first, falls back to mainnet optionally.
 - **Multi-scenario support** — Chain multiple transaction scenarios in one test, with assertions between each step.
 - **Zero boilerplate** — `runTest()` handles workspace setup, account creation, transaction execution, and cleanup.
 
@@ -33,6 +34,7 @@ const payer = Keypair.generate();
 
 await runTest({
   testConfig: {
+    routeWorkspaceToTemp: true, // protect your repo artifacts
     scenarios: [
       {
         name: "Transfer SOL",
@@ -58,9 +60,32 @@ await runTest({
 
 ## Core Concepts
 
-### Workspace Isolation
+### `routeWorkspaceToTemp` — Protecting Your Codebase Artifacts
 
-Every test gets its own temporary workspace. Accounts, programs, and state are copied in, and cleaned up after.
+This is the most important flag in Solarium. When enabled, the test runner copies your entire workspace to a temporary directory before execution. All mutations (account state changes, program outputs) happen in the temp copy — **your committed artifacts are never touched**.
+
+Without it, the Solana test runtime writes directly into your workspace, modifying the account JSON files you carefully downloaded and committed. This contaminates your repo with post-execution state and breaks idempotency.
+
+```typescript
+await runTest({
+  testConfig: {
+    routeWorkspaceToTemp: true, // always recommended
+    scenarios: [/* ... */],
+  },
+  // ...
+});
+```
+
+**The recommended workflow:**
+
+1. Download mainnet accounts with `AccountDownloader` into your workspace
+2. Commit those account artifacts to your repo (they're your test fixtures)
+3. Set `routeWorkspaceToTemp: true` so tests run against a temp copy
+4. Tests are hermetic and idempotent — run them 1000 times, same result
+
+### Workspace Structure
+
+Every test workspace follows a standard layout. Accounts and programs are stored as JSON/SO files, and `routeWorkspaceToTemp` ensures they stay clean across runs.
 
 ```typescript
 import { WorkspaceManager, buildWorkspace } from "solarium";
@@ -98,7 +123,7 @@ TokenHacker.createTokenAccount({
 
 ### Live Account Downloading
 
-Pull real on-chain accounts for integration-style tests:
+Pull real on-chain accounts and commit them as test fixtures. These become your source-of-truth artifacts — `routeWorkspaceToTemp` ensures tests never overwrite them.
 
 ```typescript
 import { AccountDownloader } from "solarium";
@@ -108,18 +133,60 @@ await downloader.download({
   accounts: [new PublicKey("So11111111111111111111111111111111111111112")],
   outputDir: "./test-workspace/accounts",
 });
+
+// Now commit these to your repo:
+//   git add test-workspace/accounts/
+//   git commit -m "Add mainnet account fixtures"
 ```
 
-### Connection Mock
+### ConnectionMock — Drop-in `web3.Connection` Replacement
 
-Use `ConnectionMock` to resolve accounts from your workspace's file system instead of making RPC calls:
+`ConnectionMock` extends `web3.Connection`, making it a true drop-in substitute anywhere your code expects a Solana connection. Instead of hitting an RPC endpoint, it reads account data from your workspace artifacts first. If an account isn't found locally, it can optionally fall back to mainnet, fetch the data, and auto-cache it into your workspace for future runs.
 
 ```typescript
 import { ConnectionMock } from "solarium";
 
-const connection = new ConnectionMock("./test-workspace/accounts");
+// Drop-in replacement for web3.Connection
+const connection = new ConnectionMock("https://api.mainnet-beta.solana.com");
+connection.setArtifactsDir("./artifacts");
+connection.setWorkspace("my-test");
+
+// Reads from workspace first — no RPC call if the account artifact exists
 const accountInfo = await connection.getAccountInfo(publicKey);
+
+// Pass it anywhere a web3.Connection is expected
+await someSDKFunction(connection, params);
 ```
+
+**How it works:**
+
+1. Every overridden method (`getAccountInfo`, `getMultipleAccountsInfo`, `getProgramAccounts`, `getAccountInfoAndContext`) checks the workspace directory for a matching `<pubkey>.json` file first
+2. If found, it returns the artifact data — no network call
+3. If not found and `skipMainnet` is `false` for that method, it calls `super` (the real `web3.Connection`) to fetch from the chain
+4. Fetched accounts are automatically saved to the workspace as JSON, so subsequent runs hit the local cache
+5. Auto-loaded programs and custom program mappings are skipped to avoid storing unnecessary data
+
+**`skipMainnet` control:**
+
+By default, all mainnet fallbacks are disabled — the mock is fully offline. This is the safe default for hermetic tests. When you need to seed your workspace with real data, disable the skip for the methods you need:
+
+```typescript
+// skipMainnet defaults (all true = fully offline)
+{
+  getProgramAccounts: true,
+  getMultipleAccountsInfo: true,
+  getAccountInfo: true,
+  getAccountInfoAndContext: true,
+}
+```
+
+**`getProgramAccounts` with filters:**
+
+The mock supports `dataSize` and `memcmp` filters (base58 and base64 encoding), applied against the workspace artifacts. This means SDK calls that use `getProgramAccounts` with filters work out of the box against your local data.
+
+This design means you can use `ConnectionMock` for two workflows:
+- **Offline testing** — read exclusively from committed artifacts, no network required
+- **Artifact seeding** — allow mainnet fallback to auto-populate your workspace, then commit the results
 
 ### Multi-Scenario Tests
 
@@ -128,6 +195,7 @@ Chain dependent scenarios with shared account state:
 ```typescript
 await runTest({
   testConfig: {
+    routeWorkspaceToTemp: true,
     scenarios: [
       {
         name: "Initialize",
